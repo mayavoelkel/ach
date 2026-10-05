@@ -18,7 +18,9 @@
 package ach
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -767,4 +769,194 @@ func TestWriteBypassValidation(t *testing.T) {
 	if err := writer.Write(file); err != nil {
 		t.Fatal(err)
 	}
+}
+
+var errDestinationFull = errors.New("destination full")
+
+// failAfterWriter accepts the first limit bytes and then fails, simulating a
+// destination (disk, network connection) that breaks partway through a file.
+type failAfterWriter struct {
+	limit int
+	buf   bytes.Buffer
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buf.Len()
+	if remaining <= 0 {
+		return 0, errDestinationFull
+	}
+	if len(p) > remaining {
+		w.buf.Write(p[:remaining])
+		return remaining, errDestinationFull
+	}
+	return w.buf.Write(p)
+}
+
+// newUnbufferedWriter returns a Writer whose internal buffer is a single byte,
+// so a failing destination is noticed on the exact record being written.
+func newUnbufferedWriter(dst io.Writer) *Writer {
+	w := NewWriter(dst)
+	w.w = bufio.NewWriterSize(dst, 1)
+	w.BypassValidation = true
+	return w
+}
+
+// mockFileEveryAddenda returns a non-ADV file holding a PPD batch whose entry
+// carries every addenda type the writer handles, plus an IAT batch whose entry
+// carries Addenda10-18, 98 and 99. The combination is not Nacha-valid and must
+// be written with BypassValidation.
+func mockFileEveryAddenda(t *testing.T) *File {
+	t.Helper()
+
+	file := NewFile().SetHeader(mockFileHeader())
+	file.AddBatch(mockBatchPPD(t))
+	file.AddIATBatch(mockIATBatch(t))
+	require.NoError(t, file.Create())
+
+	entry := file.Batches[0].GetEntries()[0]
+	entry.Addenda02 = mockAddenda02()
+	entry.Addenda05 = []*Addenda05{mockAddenda05(), nil, mockAddenda05()}
+	entry.Addenda98 = mockAddenda98()
+	entry.Addenda98Refused = mockAddenda98Refused()
+	entry.Addenda99 = mockAddenda99()
+	entry.Addenda99Dishonored = mockAddenda99Dishonored()
+	entry.Addenda99Contested = mockAddenda99Contested()
+
+	iatEntry := file.IATBatches[0].GetEntries()[0]
+	iatEntry.Addenda17 = []*Addenda17{mockAddenda17(), nil, mockAddenda17B()}
+	iatEntry.Addenda18 = []*Addenda18{mockAddenda18(), nil, mockAddenda18B()}
+	iatEntry.Addenda98 = mockIATAddenda98()
+	iatEntry.Addenda99 = mockIATAddenda99()
+
+	return file
+}
+
+func mockFileADVWithAddenda99(t *testing.T) *File {
+	t.Helper()
+
+	file := mockFileADV(t)
+	file.Batches[0].GetADVEntries()[0].Addenda99 = mockAddenda99()
+	return file
+}
+
+// TestWriter_DestinationFailsPartway cuts the destination off at every byte
+// offset of a file and checks the writer always reports the failure and never
+// writes anything other than an exact prefix of the correct output.
+func TestWriter_DestinationFailsPartway(t *testing.T) {
+	cases := []struct {
+		name string
+		file func(t *testing.T) *File
+	}{
+		{"every addenda type with IAT", mockFileEveryAddenda},
+		{"ADV with addenda99", mockFileADVWithAddenda99},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file := tc.file(t)
+
+			var expected bytes.Buffer
+			require.NoError(t, newUnbufferedWriter(&expected).Write(file))
+
+			var buffered bytes.Buffer
+			bw := NewWriter(&buffered)
+			bw.BypassValidation = true
+			require.NoError(t, bw.Write(file))
+			require.Equal(t, buffered.String(), expected.String(), "buffering must not change output")
+
+			want := expected.String()
+			require.Contains(t, want, paddingLine, "file should end with block padding")
+
+			for limit := 0; limit < len(want); limit++ {
+				dst := &failAfterWriter{limit: limit}
+				err := newUnbufferedWriter(dst).Write(file)
+				require.ErrorIs(t, err, errDestinationFull, "limit=%d", limit)
+				require.Equal(t, want[:limit], dst.buf.String(), "limit=%d", limit)
+			}
+
+			dst := &failAfterWriter{limit: len(want)}
+			require.NoError(t, newUnbufferedWriter(dst).Write(file))
+			require.Equal(t, want, dst.buf.String())
+		})
+	}
+}
+
+// TestWriter_FailedFlushIsReported checks a failure that only surfaces when
+// buffered data is flushed at the end of Write is not swallowed.
+func TestWriter_FailedFlushIsReported(t *testing.T) {
+	file := mockFilePPD(t)
+
+	var expected bytes.Buffer
+	require.NoError(t, NewWriter(&expected).Write(file))
+
+	dst := &failAfterWriter{limit: expected.Len() - 1}
+	err := NewWriter(dst).Write(file)
+	require.ErrorIs(t, err, errDestinationFull)
+	require.Equal(t, expected.String()[:expected.Len()-1], dst.buf.String())
+}
+
+// TestWriter_LargeFileRoundTrip writes a file large enough to fill the
+// writer's internal buffer several times and reads it back.
+func TestWriter_LargeFileRoundTrip(t *testing.T) {
+	const entryCount = 150
+
+	batch := NewBatchPPD(mockBatchPPDHeader())
+	for i := 1; i <= entryCount; i++ {
+		entry := mockPPDEntryDetail()
+		entry.SetTraceNumber(mockBatchPPDHeader().ODFIIdentification, i)
+		batch.AddEntry(entry)
+	}
+	require.NoError(t, batch.Create())
+
+	file := NewFile().SetHeader(mockFileHeader())
+	file.AddBatch(batch)
+	require.NoError(t, file.Create())
+
+	var out bytes.Buffer
+	require.NoError(t, NewWriter(&out).Write(file))
+	require.Greater(t, out.Len(), 3*4096, "file must exceed the default 4KB write buffer several times")
+
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	require.Zero(t, len(lines)%10, "file must be padded to a multiple of 10 lines")
+	for i, line := range lines {
+		require.Len(t, line, RecordLength, "line %d", i+1)
+	}
+
+	read, err := NewReader(strings.NewReader(out.String())).Read()
+	require.NoError(t, err)
+	require.Len(t, read.Batches, 1)
+	require.Len(t, read.Batches[0].GetEntries(), entryCount)
+
+	var rewritten bytes.Buffer
+	require.NoError(t, NewWriter(&rewritten).Write(&read))
+	require.Equal(t, out.String(), rewritten.String())
+}
+
+func TestNewWriterWithOpts_LineEnding(t *testing.T) {
+	file := mockFilePPD(t)
+
+	var out bytes.Buffer
+	w := NewWriterWithOpts(&out, &WriteOpts{LineEnding: "\r\n"})
+	require.Equal(t, "\r\n", w.LineEnding)
+	require.NoError(t, w.Write(file))
+
+	lines := strings.SplitAfter(out.String(), "\n")
+	require.Empty(t, lines[len(lines)-1])
+	for _, line := range lines[:len(lines)-1] {
+		require.Len(t, line, RecordLength+2)
+		require.True(t, strings.HasSuffix(line, "\r\n"))
+	}
+
+	read, err := NewReader(strings.NewReader(out.String())).Read()
+	require.NoError(t, err)
+	require.NoError(t, read.Validate())
+
+	require.Equal(t, "\n", NewWriterWithOpts(&out, nil).LineEnding)
+	require.Equal(t, "\n", NewWriterWithOpts(&out, &WriteOpts{}).LineEnding)
+}
+
+func TestWriter_FlushNilWriter(t *testing.T) {
+	var nilWriter *Writer
+	require.EqualError(t, nilWriter.Flush(), "nil writer")
+	require.EqualError(t, (&Writer{}).Flush(), "nil writer")
 }
