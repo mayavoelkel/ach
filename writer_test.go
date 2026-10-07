@@ -18,7 +18,9 @@
 package ach
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -767,4 +769,132 @@ func TestWriteBypassValidation(t *testing.T) {
 	if err := writer.Write(file); err != nil {
 		t.Fatal(err)
 	}
+}
+
+var errInjectedWrite = errors.New("injected write failure")
+
+// failAfterWriter accepts up to limit bytes and then fails, like a full disk
+// or a dropped connection.
+type failAfterWriter struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	room := f.limit - f.buf.Len()
+	if room <= 0 {
+		return 0, errInjectedWrite
+	}
+	if len(p) > room {
+		f.buf.Write(p[:room])
+		return room, errInjectedWrite
+	}
+	return f.buf.Write(p)
+}
+
+// mockFileEveryRecordType returns a file holding every record type the Writer handles.
+func mockFileEveryRecordType(t *testing.T) *File {
+	t.Helper()
+
+	file := mockFilePPD(t)
+	entry := file.Batches[0].GetEntries()[0]
+	entry.Addenda02 = mockAddenda02()
+	entry.AddAddenda05(mockAddenda05())
+	entry.Addenda98 = mockAddenda98()
+	entry.Addenda98Refused = mockAddenda98Refused()
+	entry.Addenda99 = mockAddenda99()
+	entry.Addenda99Dishonored = mockAddenda99Dishonored()
+	entry.Addenda99Contested = mockAddenda99Contested()
+
+	iatBatch := mockIATBatch(t)
+	iatEntry := iatBatch.GetEntries()[0]
+	iatEntry.AddAddenda17(mockAddenda17())
+	iatEntry.AddAddenda18(mockAddenda18())
+	iatEntry.Addenda98 = mockIATAddenda98()
+	iatEntry.Addenda99 = mockIATAddenda99()
+	file.AddIATBatch(iatBatch)
+
+	return file
+}
+
+func mockFileADVWithReturn(t *testing.T) *File {
+	t.Helper()
+
+	file := mockFileADV(t)
+	file.Batches[0].GetADVEntries()[0].Addenda99 = mockAddenda99()
+	return file
+}
+
+// writeWithFailureAt writes file to a destination that fails after limit bytes.
+// The Writer's buffer is shrunk so the failure surfaces on the exact record being written.
+func writeWithFailureAt(file *File, lineEnding string, limit int) ([]byte, error) {
+	dst := &failAfterWriter{limit: limit}
+	w := NewWriterWithOpts(dst, &WriteOpts{LineEnding: lineEnding})
+	w.BypassValidation = true
+	w.w = bufio.NewWriterSize(dst, 1)
+	err := w.Write(file)
+	return dst.buf.Bytes(), err
+}
+
+func testWriteFailsPartway(t *testing.T, file *File, lineEnding string) {
+	t.Helper()
+
+	var expected bytes.Buffer
+	w := NewWriterWithOpts(&expected, &WriteOpts{LineEnding: lineEnding})
+	w.BypassValidation = true
+	require.NoError(t, w.Write(file))
+
+	full := expected.Bytes()
+	lineLength := RecordLength + len(lineEnding)
+	require.Zero(t, len(full)%lineLength)
+	require.Contains(t, string(full), paddingLine+lineEnding, "expected block padding to be written")
+
+	// Fail at the start of every line and between every record and its line ending.
+	for line := 0; line < len(full)/lineLength; line++ {
+		for _, limit := range []int{line * lineLength, line*lineLength + RecordLength} {
+			written, err := writeWithFailureAt(file, lineEnding, limit)
+			require.ErrorIs(t, err, errInjectedWrite, "line %d, failing after %d bytes", line+1, limit)
+			require.Equal(t, string(full[:limit]), string(written), "line %d, failing after %d bytes", line+1, limit)
+		}
+	}
+
+	written, err := writeWithFailureAt(file, lineEnding, len(full))
+	require.NoError(t, err)
+	require.Equal(t, string(full), string(written))
+}
+
+func TestWriter_FailsPartway(t *testing.T) {
+	cases := []struct {
+		name       string
+		file       func(t *testing.T) *File
+		lineEnding string
+	}{
+		{"every record type", mockFileEveryRecordType, "\n"},
+		{"every record type with CRLF", mockFileEveryRecordType, "\r\n"},
+		{"ADV", mockFileADVWithReturn, "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testWriteFailsPartway(t, tc.file(t), tc.lineEnding)
+		})
+	}
+}
+
+func TestWriter_FailsOnFinalFlush(t *testing.T) {
+	file := mockFilePPD(t)
+
+	var expected bytes.Buffer
+	require.NoError(t, NewWriter(&expected).Write(file))
+
+	// The default buffer holds this whole file, so nothing reaches the destination until the final flush.
+	dst := &failAfterWriter{limit: 100}
+	err := NewWriter(dst).Write(file)
+	require.ErrorIs(t, err, errInjectedWrite)
+	require.Equal(t, expected.String()[:100], dst.buf.String())
+}
+
+func TestWriter_FlushNil(t *testing.T) {
+	var w *Writer
+	require.EqualError(t, w.Flush(), "nil writer")
+	require.EqualError(t, (&Writer{}).Flush(), "nil writer")
 }
